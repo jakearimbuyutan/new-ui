@@ -20597,6 +20597,38 @@ async function deleteNutrPlan(clientUid, planId) {
 // ── MONITOR ALL CLIENTS ──
 let _nutrSimpleData = {};
 
+// Computes the display fields (target, adherence, today's totals) from a plan doc + week of logs.
+function _computeNutrSimpleFields(plan, logDocs, today) {
+  const logsByDate = {};
+  logDocs.forEach(d => {
+    const l = d.data();
+    const date = l.date;
+    if (!date) return;
+    if (!logsByDate[date]) logsByDate[date] = {calories:0, protein:0, carbs:0, fats:0};
+    logsByDate[date].calories += (l.calories ?? 0);
+    logsByDate[date].protein  += (l.protein_g ?? l.protein ?? 0);
+    logsByDate[date].carbs   += (l.carbs_g   ?? l.carbs   ?? 0);
+    logsByDate[date].fats    += (l.fat_g     ?? l.fats    ?? 0);
+  });
+  const target = plan ? (plan.calories||0) : 0;
+  let daysHit = 0;
+  for (let i=0;i<7;i++) {
+    const dk = _dateKey(-i);
+    const day = logsByDate[dk];
+    if (target && day && day.calories > 0 && Math.abs(day.calories-target) <= target*0.1) daysHit++;
+  }
+  const adherence = target ? Math.round(daysHit/7*100) : null;
+  const todayTotals = logsByDate[today] || {calories:0, protein:0, carbs:0, fats:0};
+  return { target, adherence, todayTotals };
+}
+
+function _paintNutrSimpleRow(uid, target, adherence) {
+  const subEl  = document.getElementById('nsr-sub-'+uid);
+  const kcalEl = document.getElementById('nsr-kcal-'+uid);
+  if (subEl)  subEl.textContent  = target ? (adherence!==null ? adherence+'% adherence this week' : 'No target set') : 'No macro plan assigned';
+  if (kcalEl) kcalEl.textContent = target ? target.toLocaleString()+' kcal' : '—';
+}
+
 async function loadNutritionSimpleView() {
   const listEl = document.getElementById('nutr-simple-list');
   if (!listEl) return;
@@ -20623,6 +20655,31 @@ async function loadNutritionSimpleView() {
 
   _nutrSimpleData = {};
 
+  // Pass 1 — instant paint from Firestore's local IndexedDB cache (see enablePersistence() in the
+  // Firebase init block). Best-effort per client: a cache miss here is normal on first-ever load
+  // or for a brand-new client, and pass 2 below fills those in from the network regardless.
+  await Promise.all(clients.map(async c => {
+    try {
+      const [planSnap, logSnap] = await Promise.all([
+        db.collection('members').doc(c.uid).collection('nutritionPlans').orderBy('assignedAt','desc').limit(1).get({ source: 'cache' }),
+        db.collection('members').doc(c.uid).collection('mealLogs').where('date','>=',weekAgo).where('date','<=',today).get({ source: 'cache' })
+      ]);
+      const plan = planSnap.docs[0] ? planSnap.docs[0].data() : null;
+      const planDocId = planSnap.docs[0] ? planSnap.docs[0].id : null;
+      const { target, adherence, todayTotals } = _computeNutrSimpleFields(plan, logSnap.docs, today);
+      const name = ((c.firstName||'')+' '+(c.lastName||'')).trim() || c.email || 'Client';
+      _nutrSimpleData[c.uid] = { plan, planDocId, todayTotals, adherence, name };
+      _paintNutrSimpleRow(c.uid, target, adherence);
+    } catch (e) { /* nothing cached locally yet — normal, pass 2 below fetches from the network */ }
+  }));
+
+  // Auto-select as soon as the cache pass is in, so the detail panel isn't stuck waiting either.
+  const firstWithPlanCached = clients.find(c => _nutrSimpleData[c.uid] && _nutrSimpleData[c.uid].plan);
+  const toSelectCached = firstWithPlanCached || (Object.keys(_nutrSimpleData).length ? clients[0] : null);
+  if (toSelectCached) selectSimpleClient(toSelectCached.uid);
+
+  // Pass 2 — refresh from the network so numbers are current, updating each row (and the cache
+  // that pass 1 will read from next time) as each client's real fetch comes back.
   await Promise.all(clients.map(async c => {
     const name = ((c.firstName||'')+' '+(c.lastName||'')).trim() || c.email || 'Client';
     try {
@@ -20632,37 +20689,16 @@ async function loadNutritionSimpleView() {
       ]);
       const plan = planSnap.docs[0] ? planSnap.docs[0].data() : null;
       const planDocId = planSnap.docs[0] ? planSnap.docs[0].id : null;
-      const logsByDate = {};
-      logSnap.docs.forEach(d => {
-        const l = d.data();
-        const date = l.date;
-        if (!date) return;
-        if (!logsByDate[date]) logsByDate[date] = {calories:0, protein:0, carbs:0, fats:0};
-        logsByDate[date].calories += (l.calories ?? 0);
-        logsByDate[date].protein  += (l.protein_g ?? l.protein ?? 0);
-        logsByDate[date].carbs   += (l.carbs_g   ?? l.carbs   ?? 0);
-        logsByDate[date].fats    += (l.fat_g     ?? l.fats    ?? 0);
-      });
-      const target = plan ? (plan.calories||0) : 0;
-      let daysHit = 0;
-      for (let i=0;i<7;i++) {
-        const dk = _dateKey(-i);
-        const day = logsByDate[dk];
-        if (target && day && day.calories > 0 && Math.abs(day.calories-target) <= target*0.1) daysHit++;
-      }
-      const adherence = target ? Math.round(daysHit/7*100) : null;
-      const todayTotals = logsByDate[today] || {calories:0, protein:0, carbs:0, fats:0};
+      const { target, adherence, todayTotals } = _computeNutrSimpleFields(plan, logSnap.docs, today);
 
       _nutrSimpleData[c.uid] = { plan, planDocId, todayTotals, adherence, name };
-
-      const subEl  = document.getElementById('nsr-sub-'+c.uid);
-      const kcalEl = document.getElementById('nsr-kcal-'+c.uid);
-      if (subEl)  subEl.textContent  = target ? (adherence!==null ? adherence+'% adherence this week' : 'No target set') : 'No macro plan assigned';
-      if (kcalEl) kcalEl.textContent = target ? target.toLocaleString()+' kcal' : '—';
+      _paintNutrSimpleRow(c.uid, target, adherence);
     } catch(e) {
-      _nutrSimpleData[c.uid] = { plan:null, todayTotals:{calories:0,protein:0,carbs:0,fats:0}, adherence:null, name };
-      const subEl = document.getElementById('nsr-sub-'+c.uid);
-      if (subEl) subEl.textContent = 'Error loading';
+      if (!_nutrSimpleData[c.uid]) {
+        _nutrSimpleData[c.uid] = { plan:null, todayTotals:{calories:0,protein:0,carbs:0,fats:0}, adherence:null, name };
+        const subEl = document.getElementById('nsr-sub-'+c.uid);
+        if (subEl) subEl.textContent = 'Error loading';
+      }
     }
   }));
 
