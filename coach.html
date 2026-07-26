@@ -12379,6 +12379,55 @@ async function exportClientDocx() {
 
 window._clientPhotosCache = window._clientPhotosCache || {};
 
+// Groups a set of photo docs into dated check-in sessions, newest first.
+function buildPhotoSessions(docs) {
+  const sessions = {};
+  docs.forEach(doc => {
+    const d = doc.data();
+    const dt = d.uploadedAt?.toDate ? d.uploadedAt.toDate() : new Date();
+    const dateKey = dt.toLocaleDateString('en-US', { year:'numeric', month:'2-digit', day:'2-digit' });
+    const dateLabel = dt.toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' });
+    if (!sessions[dateKey]) sessions[dateKey] = { dateKey, dateLabel, ts: dt.getTime(), photos: [] };
+    sessions[dateKey].photos.push({ doc, d });
+  });
+  return Object.values(sessions).sort((a,b) => b.ts - a.ts);
+}
+
+// Renders the labeled Before/After/Check-in grid from already-grouped sessions.
+function renderPhotoSessions(grid, sorted) {
+  grid.innerHTML = '';
+  const total = sorted.length;
+  sorted.forEach((session, idx) => {
+    let sessionLabel, labelBg, labelColor;
+    if (total === 1) { sessionLabel = 'Before'; labelBg = 'rgba(90,159,239,0.15)'; labelColor = 'var(--blue)'; }
+    else if (idx === 0) { sessionLabel = 'After — Current'; labelBg = 'rgba(61,203,114,0.12)'; labelColor = 'var(--green)'; }
+    else if (idx === 1) { sessionLabel = 'Before'; labelBg = 'rgba(90,159,239,0.15)'; labelColor = 'var(--blue)'; }
+    else { sessionLabel = `Check-in ${total - 1 - idx}`; labelBg = 'var(--gold-dim)'; labelColor = 'var(--gold)'; }
+
+    const header = document.createElement('div');
+    header.style.cssText = 'grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:12px 0 8px;margin-top:' + (idx?'10px':'0');
+    const w = session.photos[0]?.d?.weight;
+    const wu = session.photos[0]?.d?.weightUnit || 'kg';
+    header.innerHTML = `
+      <span style="font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:${labelColor};background:${labelBg};border:1px solid ${labelColor.replace('var(--','rgba(').replace(')',',0.25)')};border-radius:6px;padding:4px 10px">${sessionLabel}</span>
+      ${w ? `<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--gold);font-weight:700;background:var(--gold-dim);border:1px solid var(--border-gold);border-radius:100px;padding:3px 10px">️ ${w} ${wu}</span>` : ''}
+      <span style="font-size:11px;color:var(--muted)">${session.dateLabel}</span>
+      <div style="flex:1;height:1px;background:var(--border)"></div>`;
+    grid.appendChild(header);
+
+    session.photos.forEach(({ doc: docc, d }) => {
+      const src = d.base64 || d.url || '';
+      const angleMap = { front:'Front', back:'Back', left:'Left Side', right:'Right Side' };
+      const cell = document.createElement('div');
+      cell.className = 'photo-thumb';
+      const angBadge = d.angle ? `<div class="photo-angle-badge">${angleMap[d.angle]||d.angle}</div>` : '';
+      cell.innerHTML = `<img src="${src}" alt="Progress photo" loading="lazy">${angBadge}`;
+      cell.onclick = () => openLightboxById(docc.id, fmtDate(d.uploadedAt), d.note||'');
+      grid.appendChild(cell);
+    });
+  });
+}
+
 async function loadClientPhotos(uid, forceRefresh) {
   const grid = document.getElementById('m-photo-grid');
 
@@ -12397,66 +12446,50 @@ async function loadClientPhotos(uid, forceRefresh) {
 
   // Instant paint from Firestore's local IndexedDB cache (populated by earlier visits and
   // persisted across browser restarts — see enablePersistence() in the Firebase init block).
-  // This is best-effort: on a brand-new device/profile there's nothing cached yet, so a miss
-  // here is normal and we just fall through to the network fetch below.
-  const renderQuickThumbs = (docs) => {
-    grid.innerHTML = '<div style="grid-column:1/-1;font-size:11px;color:var(--muted);padding-bottom:8px;">Loading photos…</div>';
-    docs.forEach(doc => {
-      const d = doc.data();
-      const src = d.base64 || d.url || '';
-      const angleMap = { front:'Front', back:'Back', left:'Left Side', right:'Right Side' };
-      const cell = document.createElement('div');
-      cell.className = 'photo-thumb';
-      const angBadge = d.angle ? `<div class="photo-angle-badge">${angleMap[d.angle]||d.angle}</div>` : '';
-      cell.innerHTML = `<img src="${src}" alt="Progress photo" loading="lazy">${angBadge}`;
-      cell.onclick = () => openLightboxById(doc.id, fmtDate(d.uploadedAt), d.note||'');
-      grid.appendChild(cell);
-    });
-  };
+  // This already renders the final labeled Before/After/Check-in view, not just raw thumbnails,
+  // so on a normal reopen the coach never sees an unlabeled placeholder step at all.
+  let paintedFromCache = false;
   if (!forceRefresh) {
     try {
       const cacheSnap = await db.collection('members').doc(uid).collection('progressPhotos')
-        .orderBy('uploadedAt','desc').limit(12).get({ source: 'cache' });
+        .orderBy('uploadedAt','desc').limit(60).get({ source: 'cache' });
       if (!cacheSnap.empty) {
         window._photoCache = window._photoCache || {};
         cacheSnap.docs.forEach(d => { window._photoCache[d.id] = d.data(); });
-        renderQuickThumbs(cacheSnap.docs);
+        const cachedSorted = buildPhotoSessions(cacheSnap.docs);
+        renderPhotoSessions(grid, cachedSorted);
+        coachRenderBeforeAfter(cachedSorted);
+        paintedFromCache = true;
       }
     } catch (e) { /* nothing cached locally yet — normal, network fetch below fills it in */ }
   }
 
   try {
-    // First batch: a handful of photos so something renders fast. We can't yet group these into
-    // labeled sessions ("Before"/"After — Current"/etc.) since those labels depend on knowing the
-    // full, correctly-ordered set — so this batch shows as plain thumbnails as a quick preview only.
-    // This network read also refreshes the local IndexedDB cache used above for next time.
+    // First batch: a handful of photos so something renders fast even with no local cache yet.
+    // We render this straight into the labeled Before/After/Check-in layout too (instead of a
+    // plain unlabeled preview) so the coach sees the real view right away, not a placeholder.
     const firstBatch = await db.collection('members').doc(uid).collection('progressPhotos')
       .orderBy('uploadedAt','desc').limit(12).get();
 
     if (firstBatch.empty) {
-      grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">️</div><div class="empty-text">No photos yet</div></div>`;
-      coachRenderBeforeAfter([]);
+      if (!paintedFromCache) {
+        grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">️</div><div class="empty-text">No photos yet</div></div>`;
+        coachRenderBeforeAfter([]);
+      }
       return;
     }
 
     window._photoCache = window._photoCache || {};
     firstBatch.docs.forEach(d => { window._photoCache[d.id] = d.data(); });
 
-    grid.innerHTML = '<div style="grid-column:1/-1;font-size:11px;color:var(--muted);padding-bottom:8px;">Loading photos…</div>';
-    firstBatch.docs.forEach(doc => {
-      const d = doc.data();
-      const src = d.base64 || d.url || '';
-      const angleMap = { front:'Front', back:'Back', left:'Left Side', right:'Right Side' };
-      const cell = document.createElement('div');
-      cell.className = 'photo-thumb';
-      const angBadge = d.angle ? `<div class="photo-angle-badge">${angleMap[d.angle]||d.angle}</div>` : '';
-      cell.innerHTML = `<img src="${src}" alt="Progress photo" loading="lazy">${angBadge}`;
-      cell.onclick = () => openLightboxById(doc.id, fmtDate(d.uploadedAt), d.note||'');
-      grid.appendChild(cell);
-    });
+    if (!paintedFromCache) {
+      const quickSorted = buildPhotoSessions(firstBatch.docs);
+      renderPhotoSessions(grid, quickSorted);
+      coachRenderBeforeAfter(quickSorted);
+    }
 
-    // Now fetch the full set (up to 60) in the background and replace the preview with the
-    // properly session-grouped, correctly-labeled grid once it's ready.
+    // Now fetch the full set (up to 60) in the background and silently top up the view with any
+    // older check-ins once it's ready — the labeled view is already showing, so this just extends it.
     const snap = await db.collection('members').doc(uid).collection('progressPhotos').orderBy('uploadedAt','desc').limit(60).get();
     // The modal may have been closed/switched to a different client while this was in flight.
     const currentGrid = document.getElementById('m-photo-grid');
@@ -12466,56 +12499,16 @@ async function loadClientPhotos(uid, forceRefresh) {
     const photoCacheEntries = {};
     snap.docs.forEach(d => { photoCacheEntries[d.id] = d.data(); window._photoCache[d.id] = d.data(); });
 
-    // Group by session date
-    const sessions = {};
-    snap.forEach(doc => {
-      const d = doc.data();
-      const dt = d.uploadedAt?.toDate ? d.uploadedAt.toDate() : new Date();
-      const dateKey = dt.toLocaleDateString('en-US', { year:'numeric', month:'2-digit', day:'2-digit' });
-      const dateLabel = dt.toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' });
-      if (!sessions[dateKey]) sessions[dateKey] = { dateKey, dateLabel, ts: dt.getTime(), photos: [] };
-      sessions[dateKey].photos.push({ doc, d });
-    });
-    const sorted = Object.values(sessions).sort((a,b) => b.ts - a.ts);
-    const total = sorted.length;
-
-    grid.innerHTML = '';
-    sorted.forEach((session, idx) => {
-      let sessionLabel, labelBg, labelColor;
-      if (total === 1) { sessionLabel = 'Before'; labelBg = 'rgba(90,159,239,0.15)'; labelColor = 'var(--blue)'; }
-      else if (idx === 0) { sessionLabel = 'After — Current'; labelBg = 'rgba(61,203,114,0.12)'; labelColor = 'var(--green)'; }
-      else if (idx === 1) { sessionLabel = 'Before'; labelBg = 'rgba(90,159,239,0.15)'; labelColor = 'var(--blue)'; }
-      else { sessionLabel = `Check-in ${total - 1 - idx}`; labelBg = 'var(--gold-dim)'; labelColor = 'var(--gold)'; }
-
-      const header = document.createElement('div');
-      header.style.cssText = 'grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:12px 0 8px;margin-top:' + (idx?'10px':'0');
-      const w = session.photos[0]?.d?.weight;
-      const wu = session.photos[0]?.d?.weightUnit || 'kg';
-      header.innerHTML = `
-        <span style="font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:${labelColor};background:${labelBg};border:1px solid ${labelColor.replace('var(--','rgba(').replace(')',',0.25)')};border-radius:6px;padding:4px 10px">${sessionLabel}</span>
-        ${w ? `<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--gold);font-weight:700;background:var(--gold-dim);border:1px solid var(--border-gold);border-radius:100px;padding:3px 10px">️ ${w} ${wu}</span>` : ''}
-        <span style="font-size:11px;color:var(--muted)">${session.dateLabel}</span>
-        <div style="flex:1;height:1px;background:var(--border)"></div>`;
-      grid.appendChild(header);
-
-      session.photos.forEach(({ doc: docc, d }) => {
-        const src = d.base64 || d.url || '';
-        const angleMap = { front:'Front', back:'Back', left:'Left Side', right:'Right Side' };
-        const cell = document.createElement('div');
-        cell.className = 'photo-thumb';
-        const angBadge = d.angle ? `<div class="photo-angle-badge">${angleMap[d.angle]||d.angle}</div>` : '';
-        cell.innerHTML = `<img src="${src}" alt="Progress photo" loading="lazy">${angBadge}`;
-        cell.onclick = () => openLightboxById(docc.id, fmtDate(d.uploadedAt), d.note||'');
-        grid.appendChild(cell);
-      });
-    });
-
+    const sorted = buildPhotoSessions(snap.docs);
+    renderPhotoSessions(grid, sorted);
     coachRenderBeforeAfter(sorted);
 
     // Cache the finished render so reopening this client's Photos tab is instant next time.
     window._clientPhotosCache[uid] = { html: grid.innerHTML, sorted, photoCacheEntries };
   } catch(e) {
-    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-text" style="color:var(--red)">${e.message}</div></div>`;
+    if (!paintedFromCache) {
+      grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-text" style="color:var(--red)">${e.message}</div></div>`;
+    }
   }
 }
 
