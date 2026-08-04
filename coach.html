@@ -5087,7 +5087,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     <!-- ═══ DASHBOARD ═══ -->
     <div class="page active" id="page-dashboard">
-      <div id="firestore-status-banner" style="display:none;padding:10px 16px;border-radius:8px;margin-bottom:14px;font-size:13px;font-weight:500;border:1px solid currentColor;line-height:1.4"></div>
       <div class="dash-hero">
         <div>
           <div class="dash-hero-greeting" id="dash-greeting">Good Morning, <span class="accent" id="dash-coach-firstname">Coach</span>.</div>
@@ -8187,27 +8186,26 @@ async function handleCoachLogin() {
   const btn    = document.getElementById('auth-btn');
   const status = document.getElementById('auth-status');
   if (!pass) { status.textContent='Enter your password.'; status.className='auth-status error'; return; }
-  btn.disabled=true; btn.textContent='Checking…'; status.className='auth-status';
+  btn.disabled=true; btn.textContent='Signing in…'; status.className='auth-status';
   try {
-    const entered = await sha256(pass);
-    const stored  = await getStoredHash();
-    if (entered !== stored) throw new Error('Incorrect password. Please try again.');
-    sessionStorage.setItem('coachAuth', entered);
+    let userCredential;
     try {
-      await auth.signInWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
+      userCredential = await auth.signInWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
     } catch(signInErr) {
-      if (signInErr.code === 'auth/user-not-found') {
-        await auth.createUserWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
-      } else if (signInErr.code === 'auth/wrong-password' || signInErr.code === 'auth/invalid-credential') {
-        await auth.createUserWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
+      if (signInErr.code === 'auth/user-not-found' || signInErr.code === 'auth/invalid-credential' || signInErr.code === 'auth/wrong-password' || signInErr.code === 'auth/invalid-login-credentials') {
+        userCredential = await auth.createUserWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
       } else {
         throw signInErr;
       }
     }
+    if (!userCredential || !userCredential.user) throw new Error('Sign-in failed. Please try again.');
+    const entered = await sha256(pass);
+    sessionStorage.setItem('coachAuth', entered);
+    localStorage.setItem('coachPasswordHash', entered);
     if (db) {
       db.collection('logins').add({
         app: 'coach',
-        uid: auth.currentUser.uid,
+        uid: userCredential.user.uid,
         name: 'Coach',
         email: COACH_AUTH_EMAIL,
         type: 'login',
@@ -8217,7 +8215,17 @@ async function handleCoachLogin() {
     }
     bootApp();
   } catch(e) {
-    status.textContent = e.message; status.className='auth-status error';
+    let msg = e.message;
+    if (e.code === 'auth/email-already-in-use') {
+      msg = 'This account exists. Use your password to sign in.';
+    } else if (e.code === 'auth/weak-password') {
+      msg = 'Password must be at least 6 characters.';
+    } else if (e.code === 'auth/operation-not-allowed') {
+      msg = 'Email/Password sign-in is not enabled. Ask your admin to enable it in Firebase Console → Authentication → Sign-in method.';
+    } else if (e.code === 'auth/too-many-requests') {
+      msg = 'Too many attempts. Try again later.';
+    }
+    status.textContent = msg; status.className='auth-status error';
   } finally { btn.disabled=false; btn.textContent='Enter Dashboard'; }
 }
 
@@ -8282,39 +8290,30 @@ async function handleLogout() {
   document.getElementById('auth-status').className='auth-status';
 }
 
-// Auto-login if session exists
+// Auto-login if Firebase Auth session is still active
 document.addEventListener('DOMContentLoaded', async () => {
   try {
-    const session = sessionStorage.getItem('coachAuth');
-    if (session) {
-      const stored = await getStoredHash();
-      if (session === stored) {
-        if (auth.currentUser) {
-          bootApp();
-          return;
-        }
-        const unsubscribe = auth.onAuthStateChanged(user => {
-          unsubscribe();
-          if (user) {
-            bootApp();
-          } else {
-            sessionStorage.removeItem('coachAuth');
-            localStorage.removeItem('coachPasswordHash');
-            document.documentElement.classList.remove('auth-pending');
-          }
-        });
-        setTimeout(() => {
-          if (!auth.currentUser) {
-            sessionStorage.removeItem('coachAuth');
-            document.documentElement.classList.remove('auth-pending');
-          }
-        }, 5000);
-        return;
-      }
-      sessionStorage.removeItem('coachAuth');
+    if (auth.currentUser) {
+      const session = sessionStorage.getItem('coachAuth');
+      if (session) { bootApp(); return; }
     }
-  } catch(e) { console.warn('[AutoLogin] failed:', e.message); }
-  document.documentElement.classList.remove('auth-pending');
+    const unsubscribe = auth.onAuthStateChanged(user => {
+      unsubscribe();
+      if (user) {
+        const session = sessionStorage.getItem('coachAuth');
+        if (session) { bootApp(); }
+      } else {
+        sessionStorage.removeItem('coachAuth');
+        document.documentElement.classList.remove('auth-pending');
+      }
+    });
+    setTimeout(() => {
+      if (!auth.currentUser) {
+        sessionStorage.removeItem('coachAuth');
+        document.documentElement.classList.remove('auth-pending');
+      }
+    }, 3000);
+  } catch(e) { console.warn('[AutoLogin] failed:', e.message); document.documentElement.classList.remove('auth-pending'); }
 });
 
 // Helper: run a function when the browser is idle, with a fallback timeout
@@ -8392,30 +8391,15 @@ function startCoachNotifListener() {
 }
 
 async function checkFirestoreAccess() {
-  const banner = document.getElementById('firestore-status-banner');
-  if (!banner) return;
   try {
-    banner.textContent = 'Connecting...';
-    banner.style.display = 'block';
-    banner.style.background = '#1a1a1a';
-    banner.style.color = '#888';
-
-    // no-op: auth check removed
-
+    if (!auth.currentUser) {
+      console.warn('[COACH] No auth user — Firestore calls will fail');
+      return;
+    }
     await db.collection('members').limit(1).get();
-    banner.textContent = 'Connected — live data';
-    banner.style.background = '#22c55e18';
-    banner.style.color = '#22c55e';
-    setTimeout(() => { banner.style.display = 'none'; }, 4000);
+    console.log('[COACH] Firestore access OK — auth:', auth.currentUser.uid);
   } catch(e) {
-    // If it's still a permissions error even with auth, guide the coach
-    const isRules = e.code === 'permission-denied';
-    banner.textContent = isRules
-      ? ' Firestore rules are blocking access. In Firebase Console → Firestore → Rules, allow authenticated reads/writes: allow read, write: if request.auth != null;'
-      : ' Firestore error: ' + e.message;
-    banner.style.background = '#ff4d4d18';
-    banner.style.color = '#ff6b6b';
-    console.error('[COACH] Firestore access check failed:', e);
+    console.warn('[COACH] Firestore access check failed:', e.code, e.message);
   }
 }
 
@@ -22755,3 +22739,4 @@ textarea:focus-visible, select:focus-visible,
 
 </body>
 </html>
+                                                                                                                                                              
