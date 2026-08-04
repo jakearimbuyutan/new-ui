@@ -8180,6 +8180,8 @@ function toggleAuthPasswordVisibility() {
   btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
 }
 
+const COACH_AUTH_EMAIL = 'coach@evolvechat-21d6f.app';
+
 async function handleCoachLogin() {
   const pass   = document.getElementById('auth-pass').value;
   const btn    = document.getElementById('auth-btn');
@@ -8190,15 +8192,24 @@ async function handleCoachLogin() {
     const entered = await sha256(pass);
     const stored  = await getStoredHash();
     if (entered !== stored) throw new Error('Incorrect password. Please try again.');
-    // Auth handled by Firestore rules (see README — set allow read, write: if true)
-    // Store session in sessionStorage so page refresh stays logged in
     sessionStorage.setItem('coachAuth', entered);
+    try {
+      await auth.signInWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
+    } catch(signInErr) {
+      if (signInErr.code === 'auth/user-not-found') {
+        await auth.createUserWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
+      } else if (signInErr.code === 'auth/wrong-password' || signInErr.code === 'auth/invalid-credential') {
+        await auth.createUserWithEmailAndPassword(COACH_AUTH_EMAIL, pass);
+      } else {
+        throw signInErr;
+      }
+    }
     if (db) {
       db.collection('logins').add({
         app: 'coach',
-        uid: COACH_FIXED_UID,
+        uid: auth.currentUser.uid,
         name: 'Coach',
-        email: '',
+        email: COACH_AUTH_EMAIL,
         type: 'login',
         userAgent: navigator.userAgent,
         createdAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -8320,18 +8331,15 @@ function bootApp() {
     if (nameEl) nameEl.textContent = 'Coach';
     if (greetEl) greetEl.childNodes[0].textContent = timeGreeting + ', ';
   })();
-  // Fire auth and data loading in parallel — don't block dashboard on auth
+  // Auth already completed in handleCoachLogin — just load data
   loadAllClients();
   listenForUnreadMessages();
-  (auth.currentUser ? Promise.resolve() : auth.signInAnonymously()).catch(e => console.warn('[Auth] Anonymous sign-in failed:', e.message)).finally(() => {
-    // Non-critical: defer everything else to idle time
-    scheduleIdle(() => {
-      checkFirestoreAccess();
-      loadCloudinaryMedia();
-      startCoachNotifListener();
-      startCoachPresenceHeartbeat();
-    }, 500);
-  });
+  scheduleIdle(() => {
+    checkFirestoreAccess();
+    loadCloudinaryMedia();
+    startCoachNotifListener();
+    startCoachPresenceHeartbeat();
+  }, 500);
 }
 
 let _coachNotifUnsub = null;
@@ -8429,7 +8437,10 @@ async function handleChangePassword() {
 
     const newHash = await sha256(newPass);
     await db.doc(COACH_DOC).set({ passwordHash: newHash });
-    // Update session
+    localStorage.removeItem('coachPasswordHash');
+    if (auth.currentUser) {
+      auth.currentUser.updatePassword(newPass).catch(e => console.warn('[Password] Firebase Auth update failed:', e.message));
+    }
     sessionStorage.setItem('coachAuth', newHash);
     status.textContent='Password updated successfully!';
     status.className='auth-status';
