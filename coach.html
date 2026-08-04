@@ -8289,15 +8289,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (session) {
       const stored = await getStoredHash();
       if (session === stored) {
-        // no-op: auth not required
-        bootApp();
+        if (auth.currentUser) {
+          bootApp();
+          return;
+        }
+        const unsubscribe = auth.onAuthStateChanged(user => {
+          unsubscribe();
+          if (user) {
+            bootApp();
+          } else {
+            sessionStorage.removeItem('coachAuth');
+            localStorage.removeItem('coachPasswordHash');
+            document.documentElement.classList.remove('auth-pending');
+          }
+        });
+        setTimeout(() => {
+          if (!auth.currentUser) {
+            sessionStorage.removeItem('coachAuth');
+            document.documentElement.classList.remove('auth-pending');
+          }
+        }, 5000);
         return;
       }
       sessionStorage.removeItem('coachAuth');
     }
   } catch(e) { console.warn('[AutoLogin] failed:', e.message); }
-  // Session missing/invalid — reveal the login form (only relevant if
-  // 'auth-pending' was set, i.e. a stale/rejected session was being re-checked).
   document.documentElement.classList.remove('auth-pending');
 });
 
