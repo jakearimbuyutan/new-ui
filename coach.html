@@ -13019,24 +13019,31 @@ async function loadCardPhotoStrip(uid, firstName) {
 
 async function loadDashboardPhotos() {
   const feed = document.getElementById('dash-photo-scroll');
-  const placeholder = document.getElementById('dash-photo-placeholder');
   if (!feed) return;
   if (!allClients.length) {
     feed.innerHTML = `<div class="dash-photo-empty">No clients yet — photos will appear here once clients upload them.</div>`;
     return;
   }
   try {
-    // Single collectionGroup query instead of 8 per-client queries
-    const snap = await db.collectionGroup('progressPhotos').orderBy('uploadedAt','desc').limit(16).get();
-    if (snap.empty) {
+    // Parallel per-client queries (collectionGroup requires extra Firestore setup)
+    const results = [];
+    await Promise.all(allClients.slice(0, 8).map(async c => {
+      try {
+        const snap = await db.collection('members').doc(c.uid).collection('progressPhotos')
+          .orderBy('uploadedAt','desc').limit(2).get();
+        snap.docs.forEach(d => {
+          results.push({ docId: d.id, data: d.data(), client: c });
+        });
+      } catch(_) {}
+    }));
+    if (!results.length) {
       feed.innerHTML = `<div class="dash-photo-empty">No progress photos yet.<br>Photos will appear here once clients upload them.</div>`;
       return;
     }
-    const clientMap = {};
-    allClients.forEach(c => { clientMap[c.uid] = c; });
-    const results = snap.docs.map(d => {
-      const uid = d.ref.parent.parent.id;
-      return { docId: d.id, data: d.data(), client: clientMap[uid] || {} };
+    results.sort((a,b) => {
+      const at = a.data.uploadedAt?.seconds || 0;
+      const bt = b.data.uploadedAt?.seconds || 0;
+      return bt - at;
     });
     window._photoCache = window._photoCache || {};
     results.forEach(r => { window._photoCache[r.docId] = r.data; });
