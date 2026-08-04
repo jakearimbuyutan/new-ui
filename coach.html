@@ -8153,15 +8153,20 @@ async function sha256(str) {
 }
 
 async function getStoredHash() {
+  // Serve from localStorage first — eliminates Firestore round-trip on every refresh
+  const cached = localStorage.getItem('coachPasswordHash');
+  if (cached) return cached;
   try {
     const doc = await db.doc(COACH_DOC).get();
-    if (doc.exists && doc.data().passwordHash) return doc.data().passwordHash;
-    // First time: seed the default password
+    if (doc.exists && doc.data().passwordHash) {
+      localStorage.setItem('coachPasswordHash', doc.data().passwordHash);
+      return doc.data().passwordHash;
+    }
     const defaultHash = await sha256('admin123');
     await db.doc(COACH_DOC).set({ passwordHash: defaultHash });
+    localStorage.setItem('coachPasswordHash', defaultHash);
     return defaultHash;
   } catch(e) {
-    // Fallback to default if Firestore unreachable
     return await sha256('admin123');
   }
 }
@@ -8315,11 +8320,10 @@ function bootApp() {
     if (nameEl) nameEl.textContent = 'Coach';
     if (greetEl) greetEl.childNodes[0].textContent = timeGreeting + ', ';
   })();
-  // Sign in anonymously so Firestore calls are authenticated (required if rules use request.auth != null)
+  // Fire auth and data loading in parallel — don't block dashboard on auth
+  loadAllClients();
+  listenForUnreadMessages();
   (auth.currentUser ? Promise.resolve() : auth.signInAnonymously()).catch(e => console.warn('[Auth] Anonymous sign-in failed:', e.message)).finally(() => {
-    // Critical path: load clients + messages first (these drive the main UI)
-    loadAllClients();
-    listenForUnreadMessages();
     // Non-critical: defer everything else to idle time
     scheduleIdle(() => {
       checkFirestoreAccess();
@@ -9018,11 +9022,7 @@ function _renderClientGridInner() {
 // fall back to a plain re-render for the timer-driven watchdog ticks.
 let _renderFromWatchdog = false;
 function renderClientGrid() {
-  if (!_renderFromWatchdog && document.startViewTransition) {
-    document.startViewTransition(() => _renderClientGridInner());
-  } else {
-    _renderClientGridInner();
-  }
+  _renderClientGridInner();
 }
 
 function timeAgo(date) {
@@ -9141,20 +9141,34 @@ function _renderActivityFeed(feed, activities) {
 // Fallbacks preserve old behavior exactly, only used if collection-group
 // indexes haven't been enabled yet in the Firebase console.
 async function _updateDashboardStatsFallback(today, yesterday) {
+  // Use cached result if available (avoids re-running 2N queries every watchdog tick)
+  if (window._statsFallbackCache && Date.now() - window._statsFallbackCache.ts < 60000) {
+    const c = window._statsFallbackCache;
+    animateStatValue('stat-active-today', c.todayLogs);
+    animateStatValue('stat-workouts-logged', c.totalLogs);
+    animateStatValue('stat-photos', c.totalPhotos);
+    _dashYesterdayLogs = c.yesterdayLogs;
+    return;
+  }
   let totalLogs=0, todayLogs=0, yesterdayLogs=0, totalPhotos=0;
-  await Promise.all(allClients.map(async c => {
-    try {
-      const logs = await db.collection('members').doc(c.uid).collection('workoutLogs').orderBy('completedAt','desc').limit(30).get();
-      logs.forEach(l => {
-        totalLogs++;
-        const d = l.data().completedAt?.toDate?.();
-        if (d && d >= today) todayLogs++;
-        else if (d && yesterday && d >= yesterday && d < today) yesterdayLogs++;
-      });
-      const photos = await db.collection('members').doc(c.uid).collection('progressPhotos').limit(50).get();
-      totalPhotos += photos.size;
-    } catch(_) {}
-  }));
+  // Batch in groups of 5 to avoid saturating Firestore connections
+  for (let i = 0; i < allClients.length; i += 5) {
+    const batch = allClients.slice(i, i + 5);
+    await Promise.all(batch.map(async c => {
+      try {
+        const logs = await db.collection('members').doc(c.uid).collection('workoutLogs').orderBy('completedAt','desc').limit(30).get();
+        logs.forEach(l => {
+          totalLogs++;
+          const d = l.data().completedAt?.toDate?.();
+          if (d && d >= today) todayLogs++;
+          else if (d && yesterday && d >= yesterday && d < today) yesterdayLogs++;
+        });
+        const photos = await db.collection('members').doc(c.uid).collection('progressPhotos').limit(50).get();
+        totalPhotos += photos.size;
+      } catch(_) {}
+    }));
+  }
+  window._statsFallbackCache = { totalLogs, todayLogs, yesterdayLogs, totalPhotos, ts: Date.now() };
   animateStatValue('stat-active-today', todayLogs);
   animateStatValue('stat-workouts-logged', totalLogs);
   animateStatValue('stat-photos', totalPhotos);
@@ -9215,6 +9229,11 @@ function renderTodaysSessions() {
 }
 
 async function _updateActivityFeedFallback(feed) {
+  // Use cached result if available
+  if (window._activityFeedCache && Date.now() - window._activityFeedCache.ts < 60000) {
+    _renderActivityFeed(feed, window._activityFeedCache.activities);
+    return;
+  }
   const activities = [];
   await Promise.all(allClients.slice(0,10).map(async c => {
     try {
@@ -9226,7 +9245,9 @@ async function _updateActivityFeedFallback(feed) {
     } catch(_) {}
   }));
   activities.sort((a,b)=> (b.ts?.seconds||0)-(a.ts?.seconds||0));
-  _renderActivityFeed(feed, activities.slice(0,6));
+  const sliced = activities.slice(0,6);
+  window._activityFeedCache = { activities: sliced, ts: Date.now() };
+  _renderActivityFeed(feed, sliced);
 }
 
 // ─────────────────────────────────────────
@@ -12511,8 +12532,8 @@ async function loadClientPhotos(uid, forceRefresh) {
 
   grid.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div>';
 
-  // Fire IndexedDB cache read and network first batch in parallel — whichever
-  // arrives first paints thumbnails instantly, eliminating the sequential wait.
+  // Fire IndexedDB cache and network fetch in parallel — cache paints instantly,
+  // network replaces with full session-grouped view when ready.
   const renderQuickThumbs = (docs) => {
     grid.innerHTML = '';
     docs.forEach(doc => {
@@ -12544,41 +12565,18 @@ async function loadClientPhotos(uid, forceRefresh) {
   })();
 
   try {
-    const firstBatch = await db.collection('members').doc(uid).collection('progressPhotos')
-      .orderBy('uploadedAt','desc').limit(12).get();
-    // If cache already painted, skip redundant render
+    // Single network fetch — skip the intermediate 12-photo batch
+    const snap = await db.collection('members').doc(uid).collection('progressPhotos').orderBy('uploadedAt','desc').limit(60).get();
     cacheResolved = true;
+    const currentGrid = document.getElementById('m-photo-grid');
+    if (!currentGrid || currentGrid !== grid) return;
 
-    if (firstBatch.empty) {
+    if (snap.empty) {
       grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">️</div><div class="empty-text">No photos yet</div></div>`;
       coachRenderBeforeAfter([]);
       return;
     }
 
-    window._photoCache = window._photoCache || {};
-    firstBatch.docs.forEach(d => { window._photoCache[d.id] = d.data(); });
-
-    grid.innerHTML = '';
-    firstBatch.docs.forEach(doc => {
-      const d = doc.data();
-      const src = d.base64 || d.url || '';
-      const angleMap = { front:'Front', back:'Back', left:'Left Side', right:'Right Side' };
-      const cell = document.createElement('div');
-      cell.className = 'photo-thumb';
-      const angBadge = d.angle ? `<div class="photo-angle-badge">${angleMap[d.angle]||d.angle}</div>` : '';
-      cell.innerHTML = `<img src="${src}" alt="Progress photo" loading="lazy">${angBadge}`;
-      cell.onclick = () => openLightboxById(doc.id, fmtDate(d.uploadedAt), d.note||'');
-      grid.appendChild(cell);
-    });
-
-    // Now fetch the full set (up to 60) in the background and replace the preview with the
-    // properly session-grouped, correctly-labeled grid once it's ready.
-    const snap = await db.collection('members').doc(uid).collection('progressPhotos').orderBy('uploadedAt','desc').limit(60).get();
-    // The modal may have been closed/switched to a different client while this was in flight.
-    const currentGrid = document.getElementById('m-photo-grid');
-    if (!currentGrid || currentGrid !== grid) return;
-
-    // Cache photo data keyed by doc id for lightbox access (base64 too large for onclick attr)
     const photoCacheEntries = {};
     snap.docs.forEach(d => { photoCacheEntries[d.id] = d.data(); window._photoCache[d.id] = d.data(); });
 
